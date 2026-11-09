@@ -1,0 +1,17 @@
+[project]
+name = "thirteenf"
+version = "0.1.0"
+description = "Bulk download and parse SEC 13F-HR filings into SQLite"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+thirteenf = "thirteenf.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["thirteenf"]
