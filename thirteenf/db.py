@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS filings (
     value_total    REAL,     -- as stated on the filer's summary page
     n_holdings     INTEGER,  -- rows we parsed
     value_sum      REAL,     -- sum of parsed values
-    status         TEXT      -- ok / count_mismatch / value_mismatch / empty / unchecked / error
+    status         TEXT      -- ok / near / count_mismatch / value_mismatch / empty / unchecked / error
 );
 CREATE TABLE IF NOT EXISTS holdings (
     accession      TEXT REFERENCES filings(accession),
@@ -94,15 +94,16 @@ def load(data, db, reparse=False, workers=None):
 
 
 def report(con):
-    """Parse quality by filing year. %ok: parse reproduces the filer's stated entry count and value
-    total. %~ok: also counts filings whose entry count is within 2% (or 1 row) of the stated one."""
-    q = """SELECT substr(date_filed,1,4) AS yr, format, COUNT(*) AS n,
-                  ROUND(100.0 * SUM(status = 'ok') / COUNT(*), 1) AS pct_ok,
-                  ROUND(100.0 * SUM(status = 'ok' OR abs(n_holdings - entry_total) <= max(1, 0.02 * entry_total))
-                        / COUNT(*), 1) AS pct_close,
+    """Parse quality by filing year: share of filings whose parse matches the filer's own totals
+    (ok) or nearly matches them (near), and the share of holding rows in such filings."""
+    q = """SELECT substr(date_filed,1,4) AS yr, format, COUNT(*),
+                  ROUND(100.0 * SUM(status = 'ok') / COUNT(*), 1),
+                  ROUND(100.0 * SUM(status IN ('ok', 'near')) / COUNT(*), 1),
+                  ROUND(100.0 * SUM(CASE WHEN status IN ('ok', 'near') THEN n_holdings END) / SUM(n_holdings), 1),
                   SUM(status = 'count_mismatch'), SUM(status = 'value_mismatch'),
                   SUM(status = 'empty'), SUM(status = 'unchecked'), SUM(status LIKE 'error%')
            FROM filings GROUP BY yr, format ORDER BY yr, format"""
-    print(f"{'year':6}{'fmt':6}{'filings':>8}{'%ok':>7}{'%~ok':>7}{'count':>7}{'value':>7}{'empty':>7}{'unchk':>7}{'error':>7}")
+    cols = ["year", "fmt", "filings", "%ok", "%ok+near", "%rows", "count", "value", "empty", "unchk", "error"]
+    print("".join(f"{c:>9}" for c in cols))
     for r in con.execute(q):
-        print(f"{r[0] or '?':6}{r[1] or '?':6}{r[2]:>8}{r[3]:>7}{r[4]:>7}" + "".join(f"{x:>7}" for x in r[5:]))
+        print("".join(f"{'-' if x is None else x:>9}" for x in r))

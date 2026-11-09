@@ -26,6 +26,9 @@ python -m thirteenf report --db 13f.sqlite
 
 To try it on a small random sample first: `download --sample 5` grabs 5 random filings per quarter.
 
+Quarterly indexes are cached. If you download the current quarter before it has ended, rerun
+later with `--refresh-index` to pick up the filings made since.
+
 ### Full-run sizing
 
 There are about 424,000 13F-HR and 13F-HR/A filings from 2006 through 2026Q3. The downloader stays
@@ -48,7 +51,7 @@ re-parse (`parse --reparse`) without downloading again.
 | `amendment_type` | `RESTATEMENT` (replaces the original) or `NEW HOLDINGS` (adds to it) |
 | `entry_total`, `value_total` | totals the filer states on its own summary page |
 | `n_holdings`, `value_sum` | what we parsed |
-| `status` | `ok`: the parse reproduces the filer's stated count and value total. Other values: `count_mismatch`, `value_mismatch`, `empty`, `unchecked` (no summary page), `error: …` |
+| `status` | Parse vs. the filer's own totals. `ok`: entry count matches exactly and value within 1%. `near`: count within 2% (or one row) and value within 2%. Otherwise `count_mismatch` or `value_mismatch`. Also `empty` (no table), `unchecked` (no summary page), `error: …` |
 
 `holdings`: one row per line of the information table. Columns: `name_of_issuer`,
 `title_of_class`, `cusip`, `value`, `shares` (shares, or principal amount for bonds), `sh_prn`,
@@ -77,33 +80,65 @@ ORDER BY shares DESC;
   positional columns that are often blank, so reading them would mean guessing. Option rows
   carry the filer's option "CUSIP", which may not pass the check digit. A few filers give SEDOLs
   instead of CUSIPs, and some rows have no identifier at all (`cusip` NULL, about 0.1% of rows).
+- **CUSIPs are cleaned.** When a filer's spreadsheet dropped leading zeros (`37833100` for Apple)
+  and the check digit confirms it, the zeros are restored (`037833100`), in both eras. The SEC's
+  own data sets keep the raw value.
+- **Unreadable values are left empty.** Some text tables print the value and shares columns
+  with no gap between them. The parser splits them when the share count can be confirmed from
+  the voting columns. Otherwise it stores `value` and `shares` as NULL instead of a wrong number.
 
 ## Validation
 
-The SEC does not publish a parsed version of pre-2013 filings to compare against. Every filing
-does carry its own entry count and value total on the summary page, though, so each parse is
-checked against those (`status`). I ran two independent random samples, stratified at 5–6 filings
-per quarter from 2006Q1 to 2026Q3: 913 filings and 204,000 holding rows.
+Two independent checks.
 
-| era | filings | parse matches the stated count and value | count within 2% | no summary page |
-|---|---|---|---|---|
-| XML (2013Q3+) | 584 | 94.5% | 98.5% | 0 |
-| text (≤2013Q2) | 329 | 81.6% of checkable | 93.0% of checkable | 30 |
+**1. Against the SEC's own parsed data (2013 onward).** The SEC publishes its own parse of every
+XML-era filing as the quarterly [Form 13F data sets](https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets).
+I took 70 random filings from each of 2014Q1, 2019Q3 and 2024Q3. All 206 that appear in the data
+sets match row for row on all nine fields (CUSIP, value, shares, SH/PRN, put/call, discretion,
+three voting columns): 61,058 of 61,058 rows. The two left over were filed in September 2024,
+after that data set's window ends. To repeat the check on any quarter:
 
-**XML era.** Every mismatch I inspected was the filer's own summary page disagreeing with its
-table (for example a total stated in different units, or an entry count that doesn't match the
-rows filed). The parser reads every `infoTable` row.
+```bash
+python tools/compare_sec.py 13f.sqlite 2019q3_form13f.zip
+```
+
+**2. Against each filing's own totals (all years).** No parsed version of pre-2013 filings
+exists to compare against. Every filing does state its own entry count and value total on the
+summary page, so each parse is checked against those (`status`). I ran three independent random
+samples, stratified by quarter, 2001Q1–2026Q3: 1,625 filings and 680,000 holding rows.
+
+| era | filings | `ok` | `ok` or `near` | holding rows in `ok`/`near` filings | no summary page |
+|---|---|---|---|---|---|
+| XML (2013Q3+) | 796 | 95.0% | 96.7% | 97.8% | 0 |
+| text (≤2013Q2) | 829 | 81.8% | 88.7% | 91.0% | 92 |
+
+Percentages are of filings that have a summary page to check against.
+
+Large filers are less often an exact `ok` than small ones: a 3,000-row table is more likely to
+have a mistyped row, and its stated totals are more often slightly off. So filter on
+`status IN ('ok', 'near')` rather than `ok` alone, or you lose many of the biggest managers.
+
+**XML era.** The mismatches are the filer's own summary page disagreeing with its table, for
+example a total stated in different units. Check 1 shows the parser reads every row as filed.
 
 **Text era.** The remaining mismatches are mostly:
 
-1. Filer errors in the stated totals.
-2. Unusual layouts. One table printed column by column (all names, then all CUSIPs) can't be
-   read this way.
-3. Mistyped or truncated CUSIPs on single rows.
+1. Filer errors in the stated totals. Some state total shares as the entry count, or put the
+   price per share in the value column.
+2. Unusual layouts that can't be read line by line: tables printed column by column, CSV
+   exports with unlabeled columns, CUSIPs written in scientific notation by Excel.
+3. Mistyped, truncated or missing CUSIPs on individual rows.
 
-Run `python -m thirteenf report` after a full build to see the same breakdown for every year. Use
-`status` to filter, for example keep `status = 'ok'` only, or relax that to a near match on
-`n_holdings` against `entry_total`.
+Problems found and fixed during validation, all covered by `tests/`:
+
+- A second CUSIP-like code in the issuer text ("SEE CUSIP 69713P107", "WT EX030402") was taken as
+  the CUSIP. The real CUSIP was then read as the value, inflating some large filers' totals by up
+  to a trillion times.
+- Value and shares columns printed with no gap between them.
+- Filers who state the number of distinct securities as the entry count, rather than the number
+  of rows.
+
+Run `python -m thirteenf report` after a full build to see the same breakdown for every year.
 
 Tests: `python -m unittest discover tests`
 
@@ -114,5 +149,6 @@ thirteenf/edgar.py     EDGAR index + rate-limited, resumable downloader
 thirteenf/parse.py     one submission file -> (filing, holdings); XML and text parsers
 thirteenf/db.py        SQLite schema, parallel loader, quality report
 thirteenf/__main__.py  command line
+tools/compare_sec.py   check XML-era output against the SEC's Form 13F data sets
 tests/                 unit tests with inline example filings
 ```

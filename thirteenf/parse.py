@@ -77,6 +77,19 @@ def _xml_root(body):
     return ET.fromstring(src.encode("utf-8"))
 
 
+def fix_cusip(c):
+    """Uppercase, and restore leading zeros a spreadsheet dropped ("37833100" -> "037833100")
+    when the check digit confirms it."""
+    c = (c or "").strip().upper()
+    return c.zfill(9) if _zeros_dropped(c) else (c or None)
+
+
+def _zeros_dropped(c, sedol_too=False):
+    # 7-8 digits whose zero-padded form passes the CUSIP check. In XML a 7-digit code that is
+    # also a valid SEDOL is left alone; in text tables (sedol_too) it is far more often a CUSIP.
+    return c.isdigit() and len(c) in (7, 8) and cusip_ok(c.zfill(9)) and (sedol_too or not sedol_ok(c))
+
+
 def parse_xml_table(body):
     rows = []
     for el in _xml_root(body).iter():
@@ -89,7 +102,7 @@ def parse_xml_table(body):
                 f[name] = (child.text or "").strip()
         rows.append(dict(
             name_of_issuer=f.get("nameOfIssuer"), title_of_class=f.get("titleOfClass"),
-            cusip=(f.get("cusip") or "").upper() or None, value=num(f.get("value")),
+            cusip=fix_cusip(f.get("cusip")), value=num(f.get("value")),
             shares=num(f.get("sshPrnamt")), sh_prn=f.get("sshPrnamtType") or None,
             put_call=f.get("putCall") or None, discretion=f.get("investmentDiscretion") or None,
             other_managers=f.get("otherManager") or None,
@@ -153,7 +166,7 @@ def cusip_candidates(line):
         c = raw.replace(" ", "").replace("-", "")
         if sum(ch.isdigit() for ch in c) < 4 and not sedol_ok(c):
             continue
-        if len(c) < 9 and raw == c and c.isdigit() and cusip_ok(c.zfill(9)):
+        if raw == c and _zeros_dropped(c, sedol_too=True):
             c = c.zfill(9)
         elif len(c) == 10 and cusip_ok(c[1:]):
             c = c[1:]
@@ -177,24 +190,53 @@ def html_to_text(body):
 _TOTAL_RE = re.compile(r"\b(grand|column|page|sub|report)\s*totals?\b|\btotals\b|\btotal\s*[:$]|\btotal\s+\d", re.I)
 
 
+def _split_glued(token, votes):
+    """Value and shares columns printed with no gap ("63312190480SH"): split the digit run where
+    its tail equals the share count, which reappears in the voting columns after SH/PRN.
+    Returns (value, shares); either may be None if the run can't be split."""
+    digits = token.replace(",", "").split(".")[0]
+    tries = [sum(votes), sum(votes[1:]), sum(votes[2:])] + votes  # [1:], [2:] skip manager codes
+    for t in (round(t) for t in tries if t >= 100):
+        if digits.isdigit() and digits.endswith(str(t)) and len(digits) > len(str(t)):
+            return int(digits[: -len(str(t))]), t
+    # One number and it equals the share count: the value column was left blank.
+    return (None, num(token)) if any(round(num(token) or -1) == round(t) for t in tries) else (None, None)
+
+
 def parse_text_line(line, prev_text):
     if _TOTAL_RE.search(line):
         return None
-    for cusip, start, end, valid in cusip_candidates(line):
+    best = None
+    for cand in cusip_candidates(line):
+        cusip, start, end, valid = cand
         tail = line[end:].replace("$", " ")
         nums = list(_NUM_RE.finditer(tail))
         if len(nums) < 2:
             continue
-        rest = tail[nums[1].end():]
-        shprn, putcall = _SHPRN_RE.search(rest), _PUTCALL_RE.search(rest)
-        disc = _DISC_RE.search(rest, shprn.end() if shprn else 0)
+        shprn = _SHPRN_RE.search(tail, nums[0].end())
+        # Only one number before SH/PRN (or before the discretion, in tables with no SH column)
+        # means the value and shares columns were printed with no gap between them.
+        kw = shprn or re.search(r"(?i)(SOLE|SHARED|DEFINED|OTHER)", tail[nums[0].end():])
+        glued = bool(kw) and (shprn.start() if shprn else nums[0].end() + kw.start()) < nums[1].start()
+        disc = _DISC_RE.search(tail, (shprn or nums[1]).end())
+        putcall = _PUTCALL_RE.search(tail, nums[0].end())
         # Option rows use made-up CUSIPs and some filers mistype them: accept a token that fails
         # the check digit only when the rest of the line looks like a holding row.
-        if valid or shprn or putcall or disc:
-            break
-    else:
+        if not (valid or shprn or putcall or disc):
+            continue
+        # Filers sometimes put a second code in the issuer/class text ("SEE CUSIP 69713P107",
+        # "WT EX030402"). Prefer the candidate the value column directly follows, then valid ones.
+        score = (bool(re.match(r"[\s|]*\(?\d", tail)), valid)
+        if best is None or score > best[0]:
+            best = score, cand, nums, shprn, glued, disc, putcall
+    if best is None:
         return None
-    value, shares = num(nums[0].group()), num(nums[1].group())
+    _, (cusip, start, end, valid), nums, shprn, glued, disc, putcall = best
+    if glued:
+        votes = [num(m.group()) or 0 for m in nums[1:]]
+        value, shares = _split_glued(nums[0].group(), votes)
+    else:
+        value, shares = num(nums[0].group()), num(nums[1].group())
     head = line[:start].strip(" |\t") or prev_text
     parts = [p for p in re.split(r"\s{2,}|\t|\|", head) if p.strip()]
     return dict(
@@ -302,24 +344,33 @@ def parse_text_cover(text):
     # Some filing agents print "REPORT SUMMARY  313 DATA RECORDS  743603" instead of a summary page.
     agent = re.search(r"REPORT SUMMARY\s+([\d,]+)\s+DATA RECORDS\s+\$?([\d,]+)", text)
     return dict(entry_total=grab(r"Entry\s*(?:Total)?\s*:?[\s$]*(\d[\d,]*)") or (num(agent[1]) if agent else None),
-                value_total=grab(r"Value\s+Total\s*:?[\s$]*(\d[\d,]*(?:\.\d+)?)") or (num(agent[2]) if agent else None),
+                value_total=grab(r"Value\s+(?:Total|Entry)\s*:?[\s$]*(\d[\d,]*(?:\.\d+)?)") or (num(agent[2]) if agent else None),
                 amendment_type=amend, report_type=None)
 
 
 # --- whole filing -------------------------------------------------------------------------
 
 def check(entry_total, value_total, rows):
-    """'ok' if the parse reproduces the filer's own summary-page totals."""
+    """Compare the parse with the filer's own summary-page totals.
+    ok:   entry count matches exactly and value total within 1%.
+    near: entry count within 2% (or 1 row) and value total within 2%. Typical of large filers
+          with a few mistyped rows, or summary totals that are themselves slightly off.
+    Otherwise count_mismatch / value_mismatch."""
     if not rows:
         return "ok" if entry_total == 0 else "empty"
-    n, v = len(rows), sum(r["value"] or 0 for r in rows)
-    count_ok = entry_total is None or entry_total == n
-    # Filers often state the total in dollars while the table is in thousands (or vice versa).
-    value_ok = value_total is None or any(abs(v * k - value_total) <= max(2, 0.01 * value_total)
-                                          for k in (1, 1000, 0.001))
     if entry_total is None and value_total is None:
         return "unchecked"
-    return "ok" if count_ok and value_ok else ("count_mismatch" if not count_ok else "value_mismatch")
+    # Many filers state the number of distinct securities rather than the number of table rows.
+    count_gap = 0 if entry_total is None else min(abs(c - entry_total) for c in (len(rows), len({r["cusip"] for r in rows})))
+    v = sum(r["value"] or 0 for r in rows)
+    # Filers often state the total in dollars while the table is in thousands (or vice versa).
+    value_gap = 0 if not value_total else min(abs(v * k - value_total) for k in (1, 1000, 0.001)) / value_total
+    value_gap = 0 if value_total is not None and value_total == 0 == v else value_gap
+    if count_gap == 0 and value_gap <= 0.01:
+        return "ok"
+    if count_gap <= max(1, 0.02 * (entry_total or 0)) and value_gap <= 0.02:
+        return "near"
+    return "count_mismatch" if count_gap else "value_mismatch"
 
 
 def parse_filing(text):

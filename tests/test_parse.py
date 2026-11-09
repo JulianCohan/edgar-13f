@@ -1,7 +1,7 @@
 """Run with:  python -m unittest discover tests   (or pytest)"""
 import unittest
 
-from thirteenf.parse import cusip_ok, parse_filing
+from thirteenf.parse import check, cusip_ok, fix_cusip, parse_filing, parse_text_line
 
 HEADER = """<SEC-HEADER>
 ACCESSION NUMBER:\t\t0000000000-08-000001
@@ -91,6 +91,31 @@ class TestParse(unittest.TestCase):
             ("037833100", 10, 100, None, "SOLE"),          # leading zero dropped
         ])                                                 # GRAND TOTALS row skipped
         self.assertEqual(rows[1]["name_of_issuer"], "AT&T INC")
+
+    def test_text_line_edge_cases(self):
+        def parsed(line):
+            r = parse_text_line(line, "")
+            return r["cusip"], r["value"], r["shares"]
+        # a second CUSIP inside the issuer text must not be taken as the CUSIP
+        self.assertEqual(parsed("PALM INC SEE CUSIP 69713P107   COMMON STOCK     696642206     1189    61502 SH  SOLE"),
+                         ("696642206", 1189, 61502))
+        self.assertEqual(parsed("QUESTRON TECHNOLOGY INC   WT IV EX030402    748372117        3      20731 SH  OTHER  1"),
+                         ("748372117", 3, 20731))
+        # value and shares columns run together; shares reappear as sole + shared votes
+        self.assertEqual(parsed("ADC Telecom         COM    000886101      63312190480SH       sole          2149025       41455"),
+                         ("000886101", 6331, 2190480))
+        # run together and unsplittable: leave both empty rather than store a garbage value
+        self.assertEqual(parsed("AMGEN INC   NOTE 0.375% 2/0  031162AQ3   203192202500000 PRN   Defined 01 02    0    0"),
+                         ("031162AQ3", None, None))
+
+    def test_cusip_cleanup_and_near_status(self):
+        self.assertEqual(fix_cusip("37833100 "), "037833100")
+        self.assertEqual(fix_cusip("BFPMB24"), "BFPMB24")       # SEDOL, left alone
+        rows = [dict(cusip=str(i), value=10) for i in range(100)]
+        self.assertEqual(check(100, 1000, rows), "ok")
+        self.assertEqual(check(101, 1010, rows), "near")         # one row short
+        self.assertEqual(check(110, 1100, rows), "count_mismatch")
+        self.assertEqual(check(100, 1000000, rows), "ok")        # total stated in dollars
 
     def test_xml_filing(self):
         filing, rows = parse_filing(XML_FILING)
